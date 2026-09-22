@@ -1,0 +1,50 @@
+name: mttl-up-standalone
+
+services:
+  mttl-up:
+    build: .
+    restart: unless-stopped
+    mem_limit: 256m
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # MTTL-W01 UP/PC-Tool device port. Firmware uses TCP 10086, so do not remap it.
+      - "10086:10086"
+      # OTA HTTP server stays unprivileged on container TCP/10080. Host 49217 is canonical 1.0.111 primary; host 80 remains 1.0.110 bootstrap/fallback compatibility.
+      - "${OTA_PRIMARY_PORT:-49217}:10080"
+      - "${OTA_PORT:-80}:10080"
+      # Only the Web UI/API host port is configurable.
+      - "${WEB_PORT:-8080}:8080"
+    volumes:
+      # SQLite DB, config, HA encryption key and future persistent runtime state.
+      - "${DATA_PATH:-./data}:/data"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=2).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      OTA_HOST_IP: "${OTA_HOST_IP:-}"
+      # Optional public Web URL used by HA device configuration_url deep links.
+      MTTL_PUBLIC_WEB_URL: "${MTTL_PUBLIC_WEB_URL:-}"
+      # Optional one-time HA MQTT bootstrap. Leave blank to configure in Web UI.
+      HA_MQTT_ENABLED: "${HA_MQTT_ENABLED:-}"
+      HA_MQTT_HOST: "${HA_MQTT_HOST:-}"
+      HA_MQTT_PORT: "${HA_MQTT_PORT:-}"
+      HA_MQTT_USERNAME: "${HA_MQTT_USERNAME:-}"
+      HA_MQTT_PASSWORD: "${HA_MQTT_PASSWORD:-}"
+      HA_MQTT_PASSWORD_FILE: "${HA_MQTT_PASSWORD_FILE:-}"
+      HA_MQTT_TLS: "${HA_MQTT_TLS:-}"
+      HA_MQTT_TOPIC_PREFIX: "${HA_MQTT_TOPIC_PREFIX:-}"
+      HA_MQTT_DISCOVERY_PREFIX: "${HA_MQTT_DISCOVERY_PREFIX:-}"
+      HA_MQTT_BIRTH_TOPIC: "${HA_MQTT_BIRTH_TOPIC:-}"

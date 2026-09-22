@@ -1,0 +1,11 @@
+MTTL-W01 UP Standalone
+Canonical firmware: 1.0.111
+Firmware status: HARDWARE_OTA_BOOT_VERIFIED
+Firmware SHA256: 7766d8c309ea77361a31b2af0c710ee24d05d076a48ecc0c8ee9b627bb288dfb
+Backend: 0.2.11
+Backend change note: docs/BACKEND_0.2.11_REGRESSION_AUDIT_2026-09-17.md
+Android: 1.5.8 (versionCode 16)
+Production server: 192.168.1.146
+Official rollback: 1.0.110
+Stock-compatible rollback: 1.0.66
+Release bundle: dist/MTTL-W01_UP_Standalone_1.0.111_Backend-0.2.11_2026-09-17-r3.zip
