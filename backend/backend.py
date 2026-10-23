@@ -1177,6 +1177,76 @@ class Web(BaseHTTPRequestHandler):
  def cookie_header(cls,token,max_age=None):
   if max_age is None:max_age=AuthManager.SESSION_TTL
   return ('Set-Cookie',f'{cls.COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={int(max_age)}')
+ # --- Voice Assistant Bridge (Alexa / Google Home direct, no hub) ------------
+ # See docs/VOICE_ASSISTANT_BRIDGE.md. Authenticated with a dedicated bearer
+ # token instead of the admin session cookie so custom skills and Local Home
+ # TRs can drive outlets without Home Assistant or vendor cloud accounts.
+ VOICE_ID=re.compile(r'^mttl_[0-9a-f]{12}_(switch_(?:all|[1-4])|power_(?:total|[1-4]))$|^([0-9a-f]{12})$')
+ def voice_config(self):
+  env=os.getenv('VOICE_BRIDGE_TOKEN','').strip()
+  tok=env or (self.store.setting_get('voice.token') or '').strip()
+  enabled=(os.getenv('VOICE_BRIDGE_ENABLED','').strip().lower() in {'1','true','yes','on'}) if env else (self.store.setting_get('voice.enabled')=='1')
+  return bool(enabled and len(tok)>=16),tok
+ def voice_auth(self):
+  ok,tok=self.voice_config()
+  if not ok:return False
+  h=self.headers.get('Authorization','') or ''
+  supplied=h[7:].strip() if h.lower().startswith('bearer ') else self.headers.get('X-Mttl-Token','').strip()
+  return bool(supplied) and hmac.compare_digest(supplied,tok)
+ def voice_switches(self,d):
+  out=[];mac=d['mac'];base=f'mttl_{mac}_';name=d.get('alias') or f'MTTL-W01 {mac[-6:].upper()}'
+  chans={int(c.get('selector',0)):c for c in d.get('channels') or [] if str(c.get('selector','')).isdigit() and int(c.get('selector',0)) in range(1,5)}
+  all_on=all(bool(chans[n].get('on_state')) for n in range(1,5)) if len(chans)==4 and all('on_state' in chans[n] for n in range(1,5)) else None
+  out.append({'id':base+'switch_all','type':'switch','selector':0,'name':f'{name} All','online':bool(d.get('online')),'on':all_on})
+  for n in range(1,5):
+   ch=chans.get(n)
+   out.append({'id':base+f'switch_{n}','type':'switch','selector':n,'name':f"{(str((ch or {}).get('name') or '').strip() or f'Outlet {n}')} ({name})",'online':bool(d.get('online')),'on':bool(ch.get('on_state')) if ch and ch.get('on_state') is not None else None})
+  pw_total=sum(float(c.get('power_mw') or 0)/1000.0 for c in chans.values())
+  out.append({'id':base+'power_total','type':'sensor','unit':'W','name':f'{name} Power','value':round(pw_total,3)})
+  for n in range(1,5):
+   ch=chans.get(n)
+   if ch and ch.get('power_mw') is not None:out.append({'id':base+f'power_{n}','type':'sensor','unit':'W','name':f'Outlet {n} Power','value':round(float(ch['power_mw'])/1000.0,3)})
+  return out
+ def voice_get(self,p):
+  if p=='/voice/devices':
+   if not self.voice_auth():return self.send_json({'error':'unauthorized'},401)
+   items=[]
+   for d in self.store.devices():
+    if d.get('removed'):continue
+    items.extend(self.voice_switches(d))
+   return self.send_json({'backend_version':BACKEND_VERSION,'devices':items})
+  m=re.fullmatch(r'/voice/devices/([A-Za-z0-9_]+)',p)
+  if m:
+   if not self.voice_auth():return self.send_json({'error':'unauthorized'},401)
+   vid=m.group(1).lower()
+   for d in self.store.devices():
+    if d.get('removed'):continue
+    for it in self.voice_switches(d):
+     if it['id']==vid:return self.send_json(it)
+   return self.send_json({'error':'not found'},404)
+  self.send_error(404)
+ def voice_put(self,p):
+  m=re.fullmatch(r'/voice/devices/([A-Za-z0-9_]+)',p)
+  if not m:self.send_error(404);return
+  if not self.voice_auth():return self.send_json({'error':'unauthorized'},401)
+  vid=m.group(1).lower()
+  if not self.VOICE_ID.fullmatch(vid):return self.send_json({'error':'device id is not a switch'},400)
+  try:body=self.json_body()
+  except Exception as e:return self.send_json({'error':str(e)},400)
+  if type(body.get('on')) is not bool:return self.send_json({'error':'on must be JSON boolean true/false'},400)
+  mm=re.fullmatch(r'mttl_([0-9a-f]{12})_switch_(?P<sel>all|[1-4])',vid) or re.fullmatch(r'([0-9a-f]{12})',vid)
+  if not mm:return self.send_json({'error':'device id is not a switch'},400)
+  mac=mm.group(1);selector=0 if (mm.lastgroup=='sel' and mm.group('sel')=='all') or mm.lastgroup is None else int(mm.group('sel'))
+  d=self.store.device(mac)
+  if not d or d.get('removed'):return self.send_json({'error':'not found'},404)
+  log.info('voice control id=%s requested=%s',vid,'on' if body['on'] else 'off')
+  try:
+   f=asyncio.run_coroutine_threadsafe(self.manager.power(mac,selector,body['on'],source='voice'),self.loop)
+   try:r=f.result(30)
+   except concurrent.futures.TimeoutError:return self.send_json({'ok':False,'state':'indeterminate','error':'backend control deadline exceeded; transaction outcome unknown'},504)
+   status=200 if r.get('ok') else (504 if r.get('state')=='indeterminate' else 409);return self.send_json(r,status)
+  except ConnectionError as e:self.send_json({'error':str(e)},503)
+  except Exception as e:self.send_json({'error':str(e)},400)
  def backup_now(self,reason):
   if not self.backup:return None
   return self.backup.create(self.store,reason)
@@ -1203,6 +1273,7 @@ class Web(BaseHTTPRequestHandler):
   if p=='/app.js':return self.send_file(self.root/'static/app.js','application/javascript; charset=utf-8',cache='no-cache')
   if p=='/mttl-up-card.js':return self.send_file(self.root/'static/mttl-up-card.js','application/javascript; charset=utf-8',cache='no-cache')
   if p=='/api/health':return self.send_json({'ok':True,'version':BACKEND_VERSION,'devices_online':sum(1 for d in self.store.devices() if d.get('online'))})
+  if p.startswith('/voice/'):return self.voice_get(p)
   if p=='/api/auth/status':return self.send_json(self.auth.status(self.session_token()))
   if p=='/api/devices':
    admin=self.auth.valid(self.session_token())
@@ -1235,6 +1306,7 @@ class Web(BaseHTTPRequestHandler):
   self.send_error(404)
  def do_PUT(self):
   p=urlparse(self.path).path
+  if p.startswith('/voice/'):return self.voice_put(p)
   if not self.require_auth():return
   try:
    if p=='/api/auth/password':
