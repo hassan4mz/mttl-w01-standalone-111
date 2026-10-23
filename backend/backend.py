@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse,parse_qs
 from ha_bridge import HAController
+from tuya_bridge import TuyaBridge
 from backup_manager import BackupManager
 from firmware_manager import FirmwareStore,OTAHTTPServer,version_number
 
@@ -1144,7 +1145,7 @@ class Manager:
 class Web(BaseHTTPRequestHandler):
  BACKUP_DEBOUNCE_SECONDS=2.0
  _backup_debounce_lock=threading.RLock();_backup_timer=None;_backup_reasons=set()
- manager:Manager=None;store:Store=None;loop=None;root:Path=None;config_path:Path=None;ha=None;backup:BackupManager=None;auth:AuthManager=None;firmware:FirmwareStore=None
+ manager:Manager=None;store:Store=None;loop=None;root:Path=None;config_path:Path=None;ha=None;backup:BackupManager=None;auth:AuthManager=None;firmware:FirmwareStore=None;tuya=None
  COOKIE='mttl_session'
  def log_message(self,fmt,*args):log.debug('HTTP '+fmt,*args)
  def json_body(self):
@@ -1177,6 +1178,76 @@ class Web(BaseHTTPRequestHandler):
  def cookie_header(cls,token,max_age=None):
   if max_age is None:max_age=AuthManager.SESSION_TTL
   return ('Set-Cookie',f'{cls.COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={int(max_age)}')
+ # --- Voice Assistant Bridge (Alexa / Google Home direct, no hub) ------------
+ # See docs/VOICE_ASSISTANT_BRIDGE.md. Authenticated with a dedicated bearer
+ # token instead of the admin session cookie so custom skills and Local Home
+ # TRs can drive outlets without Home Assistant or vendor cloud accounts.
+ VOICE_ID=re.compile(r'^mttl_[0-9a-f]{12}_(switch_(?:all|[1-4])|power_(?:total|[1-4]))$|^([0-9a-f]{12})$')
+ def voice_config(self):
+  env=os.getenv('VOICE_BRIDGE_TOKEN','').strip()
+  tok=env or (self.store.setting_get('voice.token') or '').strip()
+  enabled=(os.getenv('VOICE_BRIDGE_ENABLED','').strip().lower() in {'1','true','yes','on'}) if env else (self.store.setting_get('voice.enabled')=='1')
+  return bool(enabled and len(tok)>=16),tok
+ def voice_auth(self):
+  ok,tok=self.voice_config()
+  if not ok:return False
+  h=self.headers.get('Authorization','') or ''
+  supplied=h[7:].strip() if h.lower().startswith('bearer ') else self.headers.get('X-Mttl-Token','').strip()
+  return bool(supplied) and hmac.compare_digest(supplied,tok)
+ def voice_switches(self,d):
+  out=[];mac=d['mac'];base=f'mttl_{mac}_';name=d.get('alias') or f'MTTL-W01 {mac[-6:].upper()}'
+  chans={int(c.get('selector',0)):c for c in d.get('channels') or [] if str(c.get('selector','')).isdigit() and int(c.get('selector',0)) in range(1,5)}
+  all_on=all(bool(chans[n].get('on_state')) for n in range(1,5)) if len(chans)==4 and all('on_state' in chans[n] for n in range(1,5)) else None
+  out.append({'id':base+'switch_all','type':'switch','selector':0,'name':f'{name} All','online':bool(d.get('online')),'on':all_on})
+  for n in range(1,5):
+   ch=chans.get(n)
+   out.append({'id':base+f'switch_{n}','type':'switch','selector':n,'name':f"{(str((ch or {}).get('name') or '').strip() or f'Outlet {n}')} ({name})",'online':bool(d.get('online')),'on':bool(ch.get('on_state')) if ch and ch.get('on_state') is not None else None})
+  pw_total=sum(float(c.get('power_mw') or 0)/1000.0 for c in chans.values())
+  out.append({'id':base+'power_total','type':'sensor','unit':'W','name':f'{name} Power','value':round(pw_total,3)})
+  for n in range(1,5):
+   ch=chans.get(n)
+   if ch and ch.get('power_mw') is not None:out.append({'id':base+f'power_{n}','type':'sensor','unit':'W','name':f'Outlet {n} Power','value':round(float(ch['power_mw'])/1000.0,3)})
+  return out
+ def voice_get(self,p):
+  if p=='/voice/devices':
+   if not self.voice_auth():return self.send_json({'error':'unauthorized'},401)
+   items=[]
+   for d in self.store.devices():
+    if d.get('removed'):continue
+    items.extend(self.voice_switches(d))
+   return self.send_json({'backend_version':BACKEND_VERSION,'devices':items})
+  m=re.fullmatch(r'/voice/devices/([A-Za-z0-9_]+)',p)
+  if m:
+   if not self.voice_auth():return self.send_json({'error':'unauthorized'},401)
+   vid=m.group(1).lower()
+   for d in self.store.devices():
+    if d.get('removed'):continue
+    for it in self.voice_switches(d):
+     if it['id']==vid:return self.send_json(it)
+   return self.send_json({'error':'not found'},404)
+  self.send_error(404)
+ def voice_put(self,p):
+  m=re.fullmatch(r'/voice/devices/([A-Za-z0-9_]+)',p)
+  if not m:self.send_error(404);return
+  if not self.voice_auth():return self.send_json({'error':'unauthorized'},401)
+  vid=m.group(1).lower()
+  if not self.VOICE_ID.fullmatch(vid):return self.send_json({'error':'device id is not a switch'},400)
+  try:body=self.json_body()
+  except Exception as e:return self.send_json({'error':str(e)},400)
+  if type(body.get('on')) is not bool:return self.send_json({'error':'on must be JSON boolean true/false'},400)
+  mm=re.fullmatch(r'mttl_([0-9a-f]{12})_switch_(?P<sel>all|[1-4])',vid) or re.fullmatch(r'([0-9a-f]{12})',vid)
+  if not mm:return self.send_json({'error':'device id is not a switch'},400)
+  mac=mm.group(1);selector=0 if (mm.lastgroup=='sel' and mm.group('sel')=='all') or mm.lastgroup is None else int(mm.group('sel'))
+  d=self.store.device(mac)
+  if not d or d.get('removed'):return self.send_json({'error':'not found'},404)
+  log.info('voice control id=%s requested=%s',vid,'on' if body['on'] else 'off')
+  try:
+   f=asyncio.run_coroutine_threadsafe(self.manager.power(mac,selector,body['on'],source='voice'),self.loop)
+   try:r=f.result(30)
+   except concurrent.futures.TimeoutError:return self.send_json({'ok':False,'state':'indeterminate','error':'backend control deadline exceeded; transaction outcome unknown'},504)
+   status=200 if r.get('ok') else (504 if r.get('state')=='indeterminate' else 409);return self.send_json(r,status)
+  except ConnectionError as e:self.send_json({'error':str(e)},503)
+  except Exception as e:self.send_json({'error':str(e)},400)
  def backup_now(self,reason):
   if not self.backup:return None
   return self.backup.create(self.store,reason)
@@ -1203,7 +1274,12 @@ class Web(BaseHTTPRequestHandler):
   if p=='/app.js':return self.send_file(self.root/'static/app.js','application/javascript; charset=utf-8',cache='no-cache')
   if p=='/mttl-up-card.js':return self.send_file(self.root/'static/mttl-up-card.js','application/javascript; charset=utf-8',cache='no-cache')
   if p=='/api/health':return self.send_json({'ok':True,'version':BACKEND_VERSION,'devices_online':sum(1 for d in self.store.devices() if d.get('online'))})
+  if p.startswith('/voice/'):return self.voice_get(p)
   if p=='/api/auth/status':return self.send_json(self.auth.status(self.session_token()))
+  if p=='/api/tuya':
+   if not self.require_auth():return
+   return self.send_json(self.tuya.public_config() if self.tuya else {'enabled':False,'error':'tuya bridge unavailable'})
+  if not self.require_auth():return
   if p=='/api/devices':
    admin=self.auth.valid(self.session_token())
    return self.send_json({'authenticated':admin,'backend_version':BACKEND_VERSION,'devices':self.manager.devices_view(False) if admin else self.manager.public_devices_view(),'removed':self.manager.devices_view(True) if admin else [],'firmware':self.firmware.status() if admin else None})
@@ -1235,6 +1311,7 @@ class Web(BaseHTTPRequestHandler):
   self.send_error(404)
  def do_PUT(self):
   p=urlparse(self.path).path
+  if p.startswith('/voice/'):return self.voice_put(p)
   if not self.require_auth():return
   try:
    if p=='/api/auth/password':
@@ -1276,6 +1353,9 @@ class Web(BaseHTTPRequestHandler):
     return self.send_json(out)
    if p=='/api/ha':
     r=self.ha.save(self.json_body());self.backup_later('ha_config');return self.send_json(r)
+   if p=='/api/tuya':
+    r=self.tuya.save(self.json_body()) if self.tuya else {'enabled':False}
+    self.backup_later('tuya_config');return self.send_json(r)
    self.send_error(404)
   except Exception as e:self.send_json({'error':str(e)},400)
  def do_POST(self):
@@ -1285,6 +1365,7 @@ class Web(BaseHTTPRequestHandler):
     body=self.json_body();token=self.auth.login(body.get('password',''))
     if not token:return self.send_json({'error':'관리자 암호가 올바르지 않습니다'},401)
     return self.send_json({'ok':True,**self.auth.status(token)},200,[self.cookie_header(token)])
+   if p=='/api/tuya/webhook':return self.tuya_webhook_post()
    if not self.require_auth():return
    if p=='/api/auth/logout':
     self.auth.logout(self.session_token());return self.send_json({'ok':True},200,[self.cookie_header('',0)])
@@ -1308,6 +1389,15 @@ class Web(BaseHTTPRequestHandler):
    if p=='/api/ha/sync':
     if not self.ha.connected:return self.send_json({'error':'HA MQTT disconnected'},503)
     return self.send_json({'ok':bool(self.ha.sync_all())})
+   if p=='/api/tuya/test':
+    if not self.tuya:return self.send_json({'error':'tuya bridge unavailable'},503)
+    r=self.tuya.test_connection();return self.send_json(r,200 if r.get('ok') else 503)
+   m=re.fullmatch(r'/api/tuya/devices/([0-9a-fA-F]{12})/(sync|unmap)',p)
+   if m and self.tuya:
+    mac=m.group(1).lower();action=m.group(2)
+    if action=='unmap':self.tuya.delete_virtual_device(mac);return self.send_json({'ok':True,'unmapped':mac})
+    r=self.tuya.sync_once();ids=self.tuya.virtual_map()
+    return self.send_json({'ok':mac in ids,'virtual_id':ids.get(mac)},200 if mac in ids else 409)
    m=re.fullmatch(r'/api/firmware/prepare/(official-111|official-110|official-66)',p)
    if m:
     prof=self.firmware.prepare_official(m.group(1));self.backup_later('firmware_prepare');return self.send_json({'ok':True,'profile':prof,'firmware':self.firmware.status()})
@@ -1342,6 +1432,28 @@ class Web(BaseHTTPRequestHandler):
    self.send_error(404)
   except ConnectionError as e:self.send_json({'error':str(e)},503)
   except Exception as e:self.send_json({'error':str(e)},400)
+ # --- Tuya Cloud bridge (Alexa / Google Home via the Tuya Smart app, no hub) --
+ # See docs/TUYA_CLOUD_BRIDGE.md. Outbound: local strip state is mirrored to
+ # Tuya cloud virtual devices; inbound: device status callbacks from Tuya are
+ # verified with the API secret signature (or a bearer webhook token) and
+ # translated into LAN control commands.
+ def tuya_enabled(self):
+  return bool(self.tuya) and self.tuya._get('enabled')=='1'
+ def tuya_webhook_post(self):
+  if not self.tuya or not self.tuya_enabled():return self.send_json({'error':'tuya bridge disabled'},403)
+  try:raw=self.raw_body(64*1024)
+  except ValueError as e:return self.send_json({'error':str(e)},400)
+  if not self.tuya.webhook_verify(self.headers,raw):return self.send_json({'error':'invalid signature'},401)
+  try:payload=json.loads(raw or b'{}')
+  except Exception:return self.send_json({'error':'invalid json body'},400)
+  event=str(payload.get('t') or payload.get('type') or '')
+  inner=payload.get('d') if isinstance(payload.get('d'),dict) else payload
+  if event in ('device_status','status','p'):
+   try:r=self.tuya.handle_webhook(inner)
+   except Exception as e:log.warning('tuya webhook handling failed: %s',e);return self.send_json({'error':str(e)},500)
+   log.info('tuya webhook handled=%s mac=%s',r.get('handled'),r.get('mac'))
+   return self.send_json({'ok':True,**r})
+  return self.send_json({'ok':True,'ignored':event or 'unknown'})
 
 def load_config(path):
  try:n=int(json.loads(path.read_text()).get('poll_interval',DEFAULT_POLL));return n if n in ALLOWED_POLL else DEFAULT_POLL
@@ -1379,15 +1491,15 @@ def secure_data_permissions(data_dir):
  except OSError:pass
 
 async def amain(args):
- root=Path(__file__).resolve().parent;data_dir=Path(args.data);data_dir.mkdir(parents=True,exist_ok=True);secure_data_permissions(data_dir);backup=BackupManager(data_dir);db_path=data_dir/'mttl_up.db';recovery=backup.recover_if_needed(db_path);store=Store(db_path);auth=AuthManager(store);poll=load_config(data_dir/'config.json');mgr=Manager(store,poll);mgr.loop=asyncio.get_running_loop();fw=FirmwareStore(store,data_dir);mgr.firmware=fw;fw.start(mgr.loop,mgr);ha=HAController(store,mgr,data_dir);mgr.ha=ha;ha.bootstrap_from_env();ha.reconfigure();await asyncio.to_thread(backup.create,store,'startup' if recovery.get('action')!='restored' else 'post_recovery');secure_data_permissions(data_dir);mt=asyncio.create_task(maintenance_loop(store),name='storage-maintenance');bt=asyncio.create_task(backup_loop(backup,store),name='verified-backup')
- Web.manager=mgr;Web.store=store;Web.loop=mgr.loop;Web.root=root;Web.config_path=data_dir/'config.json';Web.ha=ha;Web.backup=backup;Web.auth=auth;Web.firmware=fw
+ root=Path(__file__).resolve().parent;data_dir=Path(args.data);data_dir.mkdir(parents=True,exist_ok=True);secure_data_permissions(data_dir);backup=BackupManager(data_dir);db_path=data_dir/'mttl_up.db';recovery=backup.recover_if_needed(db_path);store=Store(db_path);auth=AuthManager(store);poll=load_config(data_dir/'config.json');mgr=Manager(store,poll);mgr.loop=asyncio.get_running_loop();fw=FirmwareStore(store,data_dir);mgr.firmware=fw;fw.start(mgr.loop,mgr);ha=HAController(store,mgr,data_dir);mgr.ha=ha;ha.bootstrap_from_env();ha.reconfigure();tuya=TuyaBridge(store,mgr,data_dir,ha.secret);tuya.bootstrap_from_env();await asyncio.to_thread(backup.create,store,'startup' if recovery.get('action')!='restored' else 'post_recovery');secure_data_permissions(data_dir);mt=asyncio.create_task(maintenance_loop(store),name='storage-maintenance');bt=asyncio.create_task(backup_loop(backup,store),name='verified-backup')
+ Web.manager=mgr;Web.store=store;Web.loop=mgr.loop;Web.root=root;Web.config_path=data_dir/'config.json';Web.ha=ha;Web.backup=backup;Web.auth=auth;Web.firmware=fw;Web.tuya=tuya;tuya.start(mgr.loop)
  http=ThreadingHTTPServer((args.http_host,args.http_port),Web);th=threading.Thread(target=http.serve_forever,daemon=True,name='http');th.start()
  ota_http=OTAHTTPServer((args.http_host,args.ota_http_port),fw);ota_th=threading.Thread(target=ota_http.serve_forever,daemon=True,name='ota-http');ota_th.start()
  srv=await asyncio.start_server(mgr.handle,args.listen_host,args.listen_port,limit=16384)
  log.info('MTTL UP backend TCP %s:%d / Web HTTP %s:%d / OTA HTTP %s:%d / poll=%ss',args.listen_host,args.listen_port,args.http_host,args.http_port,args.http_host,args.ota_http_port,poll)
  try:
   async with srv:await srv.serve_forever()
- finally:mt.cancel();bt.cancel();ha.stop();await fw.stop();http.shutdown();http.server_close();ota_http.shutdown();ota_http.server_close()
+ finally:mt.cancel();bt.cancel();tuya.stop();ha.stop();await fw.stop();http.shutdown();http.server_close();ota_http.shutdown();ota_http.server_close()
 def main():
  os.umask(0o077)
  ap=argparse.ArgumentParser(description='Standalone MTTL-W01 UP/PC-Tool backend')

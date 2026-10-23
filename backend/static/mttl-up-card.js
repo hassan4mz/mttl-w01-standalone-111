@@ -219,8 +219,8 @@ class MTTLUpCard extends HTMLElement {
       const active = entity?.state === "on";
       return `<button class="channel ${active ? "is-on" : "is-off"} ${usable ? "" : "unavailable"} ${this._locked ? "control-locked" : "control-unlocked"}"
         data-switch-uid="${this._uid("switch", n)}" data-power-uid="${this._uid("power", n)}" ${usable ? "" : "disabled"}
-        aria-disabled="${this._locked || !usable ? "true" : "false"}" title="${this._locked ? "제어 잠김 — 상단 잠금을 해제하세요" : "짧게: ON/OFF · 길게: Power 상세"}">
-        <div class="channel-top"><ha-icon class="power-socket-icon" icon="mdi:power-socket-de"></ha-icon>${childLocked ? `<ha-icon class="child-lock-indicator" icon="mdi:lock" title="${this._escape(this._channelName(n))} 물리 버튼 잠김" aria-label="${this._escape(this._channelName(n))} 물리 버튼 잠김"></ha-icon>` : ""}</div>
+        aria-disabled="${this._locked || !usable ? "true" : "false"}" title="${this._locked ? "Controls locked — unlock using the shield at the top" : "Short press: ON/OFF · Long press: Power details"}">
+        <div class="channel-top"><ha-icon class="power-socket-icon" icon="mdi:power-socket-de"></ha-icon>${childLocked ? `<ha-icon class="child-lock-indicator" icon="mdi:lock" title="${this._escape(this._channelName(n))} physical button locked" aria-label="${this._escape(this._channelName(n))} physical button locked"></ha-icon>` : ""}</div>
         <span class="channel-name">${this._escape(this._channelName(n))}</span>
         <div class="channel-metrics"><strong>${this._escape(this._format(power, "— W"))}</strong><span class="channel-temp">${this._escape(this._formatFixed(temperature, 0, "— °C"))}</span></div>
         <span class="state-pill ${active ? "on" : "off"}">${active ? "ON" : "OFF"}</span>
@@ -245,15 +245,15 @@ class MTTLUpCard extends HTMLElement {
       .hint{margin-top:9px;color:var(--secondary-text-color);font-size:11px;text-align:center}
       @media(max-width:600px){.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.summary.no-all{grid-template-columns:repeat(2,minmax(0,1fr))}.channel{min-height:118px}.channels.layout-1x4{gap:5px}.channels.layout-1x4 .channel{padding:8px 4px}.channels.layout-1x4 .channel-name{font-size:12px}.channels.layout-1x4 .state-pill{min-width:38px;padding:0 7px}}
     </style><ha-card>
-      <div class="header"><div class="title">${this._escape(title)}</div><div class="header-right"><span class="lock-toggle ${this._locked ? "locked" : "unlocked"}" data-lock role="button" tabindex="0" title="${this._locked ? "UI 제어 잠금 해제" : "UI 제어 잠금"}" aria-label="${this._locked ? "UI 제어 잠금 해제" : "UI 제어 잠금"}"><ha-icon icon="${this._locked ? "mdi:shield-lock" : "mdi:shield-outline"}"></ha-icon></span><div class="availability"><span class="status-dot ${usableCount ? "online" : ""}"></span>${usableCount ? "Online" : "Offline"}</div></div></div>
+      <div class="header"><div class="title">${this._escape(title)}</div><div class="header-right"><span class="lock-toggle ${this._locked ? "locked" : "unlocked"}" data-lock role="button" tabindex="0" title="${this._locked ? "Unlock UI controls" : "Lock UI controls"}" aria-label="${this._locked ? "Unlock UI controls" : "Lock UI controls"}"><ha-icon icon="${this._locked ? "mdi:shield-lock" : "mdi:shield-outline"}"></ha-icon></span><div class="availability"><span class="status-dot ${usableCount ? "online" : ""}"></span>${usableCount ? "Online" : "Offline"}</div></div></div>
       <div class="summary ${allControl ? "" : "no-all"}">
         <button data-more-uid="${this._uid("power")}"><span>Total</span><strong>${this._escape(this._format(totalPower, "— W"))}</strong></button>
         <button data-more-uid="${this._uid("energy")}"><span>Meter</span><strong>${this._escape(this._formatFixed(this._entity(this._uid("energy")), 3, "— kWh"))}</strong></button>
         <button data-more-uid="${this._uid("voltage")}"><span>Voltage</span><strong>${this._escape(this._formatFixed(voltage, 1, "— V"))}</strong></button>
-        ${allControl ? `<button class="all ${onCount === 4 ? "on" : onCount ? "partial" : ""} ${this._locked ? "control-locked" : "control-unlocked"}" data-all ${switchIds.length ? "" : "disabled"} aria-disabled="${this._locked || !switchIds.length ? "true" : "false"}"><span class="all-label">ALL${masterChildLock?.state === "on" ? `<ha-icon class="all-child-lock" icon="mdi:lock" title="${this._escape(title)} Button Lock · 물리 버튼 잠김" aria-label="${this._escape(title)} Button Lock · 물리 버튼 잠김"></ha-icon>` : ""}</span><strong>${allState}</strong></button>` : ""}
+        ${allControl ? `<button class="all ${onCount === 4 ? "on" : onCount ? "partial" : ""} ${this._locked ? "control-locked" : "control-unlocked"}" data-all ${switchIds.length ? "" : "disabled"} aria-disabled="${this._locked || !switchIds.length ? "true" : "false"}"><span class="all-label">ALL${masterChildLock?.state === "on" ? `<ha-icon class="all-child-lock" icon="mdi:lock" title="${this._escape(title)} Button Lock · physical button locked" aria-label="${this._escape(title)} Button Lock · physical button locked"></ha-icon>` : ""}</span><strong>${allState}</strong></button>` : ""}
       </div>
       <div class="channels layout-${this._config.layout}">${channels}</div>
-      ${this._registryLoaded && switchIds.length < 4 ? '<div class="hint">일부 MTTL entity를 찾지 못했습니다. HA Discovery 동기화를 확인하세요.</div>' : ''}
+      ${this._registryLoaded && switchIds.length < 4 ? '<div class="hint">Some MTTL entities were not found. Check HA Discovery sync.</div>' : ''}
     </ha-card>`;
 
     this.shadowRoot.querySelectorAll("[data-more-uid]").forEach(button => {
@@ -344,11 +344,11 @@ class MTTLUpCardEditor extends HTMLElement {
     this.shadowRoot.innerHTML = `<style>
       .editor{display:grid;gap:14px;padding:8px 0}.field{display:grid;gap:5px}.label{font-size:13px;font-weight:500;color:var(--primary-text-color)}input{box-sizing:border-box;width:100%;height:42px;padding:0 10px;border:1px solid var(--divider-color);border-radius:6px;background:var(--card-background-color);color:var(--primary-text-color);font:inherit}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.select{box-sizing:border-box;min-width:110px;height:38px;padding:0 9px;border:1px solid var(--divider-color);border-radius:6px;background:var(--card-background-color);color:var(--primary-text-color);font:inherit}.help{font-size:12px;color:var(--secondary-text-color)}
     </style><div class="editor">
-      <label class="field"><span class="label">MTTL MAC address</span><input id="mac" value="${esc(this._config.mac || "")}" maxlength="17" placeholder="001122334455"><span class="help">전체 12자리 MAC. 콜론/하이픈은 자동 제거됩니다.</span></label>
-      <label class="field"><span class="label">Card title override (optional)</span><input id="name" value="${esc(this._config.name || "")}" placeholder="HA 장치 이름 사용"></label>
-      <label class="row"><span class="label">ALL ON/OFF 제어 표시</span><ha-switch id="allControl" ${this._config.all_control !== false ? "checked" : ""}></ha-switch></label>
-      <label class="row"><span class="label">채널 배열</span><select class="select" id="layout"><option value="1x4" ${this._config.layout === "1x4" ? "selected" : ""}>1 × 4</option><option value="2x2" ${this._config.layout === "2x2" ? "selected" : ""}>2 × 2</option></select></label>
-      <span class="help">방패 아이콘은 카드 UI 제어 잠금입니다. 잠긴 Child Lock만 채널/ALL에 자물쇠로 상태 표시되며, Child Lock 제어는 카드에서 하지 않습니다. 페이지를 다시 열면 UI 제어는 다시 잠깁니다.</span>
+      <label class="field"><span class="label">MTTL MAC address</span><input id="mac" value="${esc(this._config.mac || "")}" maxlength="17" placeholder="001122334455"><span class="help">Full 12-digit MAC. Colons/hyphens are removed automatically.</span></label>
+      <label class="field"><span class="label">Card title override (optional)</span><input id="name" value="${esc(this._config.name || "")}" placeholder="Use HA device name"></label>
+      <label class="row"><span class="label">Show ALL ON/OFF control</span><ha-switch id="allControl" ${this._config.all_control !== false ? "checked" : ""}></ha-switch></label>
+      <label class="row"><span class="label">Channel layout</span><select class="select" id="layout"><option value="1x4" ${this._config.layout === "1x4" ? "selected" : ""}>1 × 4</option><option value="2x2" ${this._config.layout === "2x2" ? "selected" : ""}>2 × 2</option></select></label>
+      <span class="help">The shield icon locks the card UI controls. Only locked Child Locks are shown as padlocks on channels/ALL; Child Lock control is not offered in this card. UI controls lock again when the page is reopened.</span>
     </div>`;
     this.shadowRoot.querySelector("#mac").addEventListener("change", event => this._change("mac", event.target.value));
     this.shadowRoot.querySelector("#name").addEventListener("change", event => this._change("name", event.target.value));
